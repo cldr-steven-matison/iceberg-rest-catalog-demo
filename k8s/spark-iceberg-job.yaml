@@ -1,0 +1,41 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: iceberg-rest-spark
+  namespace: iceberg-demo
+spec:
+  backoffLimit: 0
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: spark
+          image: apache/spark:3.5.3
+          command: ["/opt/spark/bin/spark-submit"]
+          args:
+            - "--master"
+            - "local[*]"
+            - "--packages"
+            - "org.apache.iceberg:iceberg-spark-runtime-3.5_2.12:1.5.2,org.apache.iceberg:iceberg-aws-bundle:1.5.2"
+            - "--conf"
+            - "spark.jars.ivy=/tmp/.ivy2"
+            - "/opt/query/query-airlines.py"
+          env:
+            - name: HOME
+              value: /tmp
+            - name: GW
+              value: srm-iceberg-aw-dl-gateway.srm-iceb.a465-9q4k.cloudera.site
+            - name: DL
+              value: srm-iceberg-aw-dl
+            - name: CDP_JWT
+              valueFrom:
+                secretKeyRef:
+                  name: cdp-jwt
+                  key: token
+          volumeMounts:
+            - name: q
+              mountPath: /opt/query
+      volumes:
+        - name: q
+          configMap:
+            name: spark-query
