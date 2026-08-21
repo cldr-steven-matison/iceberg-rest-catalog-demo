@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # bastion-up.sh — provision (idempotent) an EC2 bastion inside the srm-iceberg VPC so the Mac can
 # reach private-subnet CDP services (Trino Web UI, Hue, HMS thrift). The bastion's ENI has a
-# 10.10.x source IP the private NLB/services already route back to — which the Client VPN lacked.
+# 10.10.x source IP the private NLB/services already route back to.
 #
 # Idempotent + tag-keyed: resolves VPC/subnet by Name tag (survives weekly rebuilds with new IDs),
 # reuses an existing bastion if present, and re-points the SSH ingress at the current Mac IP.

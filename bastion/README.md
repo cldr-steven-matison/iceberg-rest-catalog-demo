@@ -5,9 +5,8 @@ The `semi-private` env keeps CDW/Trino, Hue, and the DataLake master on private 
 small EC2 **bastion inside the VPC** + an SSH **SOCKS proxy** gives the Mac browser a path to all of
 them at their real hostnames (TLS/SNI + Knox redirects intact).
 
-Chosen over AWS Client VPN, which fails here: the private NLB has no return route to the VPN client
-CIDR, and Client VPN can't be a route-table target. A bastion's `10.10.x` source IP is in-VPC, so
-the return path just works.
+A bastion's `10.10.x` source IP is in-VPC, so the private NLB already has a return route to it and
+the path just works.
 
 ## Use
 
@@ -33,6 +32,5 @@ the return path just works.
 - **SG** — `srm-iceberg-bastion-sg` opens tcp/22 to the current Mac public IP `/32` only;
   `bastion-up.sh` refreshes it each run.
 - **Cost** — `t3.small` ≈ $0.02/hr; `--stop` when idle.
-- `vpn-teardown.sh` — deletes the abandoned Client VPN endpoint + its ACM certs.
 
 Full write-up + live IDs: `DesktopShare/cloudera-iceberg-rest-catalog-aws-plan.md` §External / VPC access.
