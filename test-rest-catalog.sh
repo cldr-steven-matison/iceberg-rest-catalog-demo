@@ -27,9 +27,16 @@ echo "# Step 3 — list tables in ${DB}"
 curl -sk -H "Authorization: Bearer ${JWT}" "${BASE}/iceberg-rest/v1/namespaces/${DB}/tables"; echo
 
 echo "# Step 4 — load table ${DB}.${TABLE} (vended-creds keys shown, secrets redacted)"
+# Runtime 7.3.2 (CM 7.13.2.10000+) moved vended creds out of top-level `.config` into the Iceberg
+# REST `storage-credentials[]` array (per the evolved REST spec). Older runtimes returned them in
+# `.config`. Merge both so this validates on either, and send the delegation header that unlocks
+# the datashare S3 read creds. (Pre-2026-09 the header was optional; the storage-credentials shape
+# is what silently broke the old `.config`-only check — see #268.)
 curl -sk -H "Authorization: Bearer ${JWT}" \
+  -H "X-Iceberg-Access-Delegation: vended-credentials" \
   "${BASE}/iceberg-rest/v1/namespaces/${DB}/tables/${TABLE}" \
-  | jq '{metadata_location: .["metadata-location"],
-         config_keys: (.config // {} | keys),
-         has_vended_creds: (((.config // {})["s3.session-token"] // "") | length > 0),
-         region: (.config // {})["client.region"]}'
+  | jq '((.config // {}) + ((.["storage-credentials"][0].config) // {})) as $c
+      | {metadata_location: .["metadata-location"],
+         config_keys: ($c | keys),
+         has_vended_creds: (($c["s3.session-token"] // "") | length > 0),
+         region: $c["client.region"]}'
