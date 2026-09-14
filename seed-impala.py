@@ -9,7 +9,8 @@ import os
 import sys
 from impala.dbapi import connect
 
-HOST = "srm-iceberg-impala-master0.srm-iceb.a465-9q4k.cloudera.site"
+# semi-private env: workers/master are on private subnets; reach Impala via the public Knox gateway
+HOST = "srm-iceberg-impala-gateway.srm-iceb.a465-9q4k.cloudera.site"
 PORT = 443
 HTTP_PATH = "srm-iceberg-impala/cdp-proxy-api/impala"
 USER = os.environ.get("WORKLOAD_USER", "steven.matison")
