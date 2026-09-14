@@ -130,13 +130,25 @@ fi
 BSG=$(aws ec2 describe-security-groups --region "$REGION" --filters "Name=group-name,Values=srm-iceberg-bastion-sg" --query 'SecurityGroups[0].GroupId' --output text 2>/dev/null)
 [ -n "$BSG" ] && [ "$BSG" != "None" ] && { echo "delete bastion SG $BSG"; aws ec2 delete-security-group --region "$REGION" --group-id "$BSG" || true; }
 
-# --- 6b. IAM + keypair pre-purge (safe whether tfstate full or empty) -----------------------
-# When tfstate is already empty (a prior destroy already ran), terraform destroy is a no-op and
-# leaves the IAM roles/policies/instance profiles + EC2 keypair from the last apply in AWS.
-# The next `terraform apply` then fails with EntityAlreadyExists on every IAM resource.
-# Explicitly delete all srm-iceberg-* IAM resources + keypair here, before destroy, so the
-# script is idempotent regardless of tfstate. || true throughout — best-effort teardown.
-echo "== pre-terraform IAM + keypair purge =="
+# --- 7. terraform destroy (CDP env+DL+cred + VPC+SG+IAM+keypair+S3+data-bucket) --------------
+# `terraform init` first — the module ref can drift between rebuilds and destroy aborts with
+# "Module source has changed" until re-init'd (hit live 2026-09-09). Destroy is idempotent: if a
+# run stops partway on a stray dependency, fix it and just re-run — it resumes from the remainder.
+# IMPORTANT: IAM purge (step 7b) runs AFTER this, not before. The CDP control plane needs
+# sts:AssumeRole on srm-iceberg-xaccount-role during DataLake deletion (describeAlarms etc.).
+# Deleting IAM before destroy causes DELETE_FAILED on the DataLake (hit live 2026-09-14).
+echo "== terraform init + destroy =="
+( cd "$TF" && terraform init -input=false && terraform destroy -auto-approve )
+# Fallback if destroy stalls on the CDP env (CDW/DH residue): uncomment, run, then re-run destroy:
+#   cdp environments delete-environment --cascade --environment-name "$ENV_NAME"
+#   ( cd "$TF" && terraform state rm $(terraform state list | grep -E 'cdp_(environment|datalake)') )
+
+# --- 7b. post-destroy IAM + keypair purge --------------------------------------------------
+# Runs AFTER terraform destroy so the CDP control plane still has the xaccount role during
+# DataLake deletion. When tfstate was already empty, destroy is a no-op and IAM resources from
+# the last apply remain — this purge catches them so the next `terraform apply` doesn't fail
+# EntityAlreadyExists. || true throughout — best-effort teardown.
+echo "== post-terraform IAM + keypair purge =="
 for IP in $(aws iam list-instance-profiles \
     --query 'InstanceProfiles[?starts_with(InstanceProfileName,`srm-iceberg-`)].InstanceProfileName' \
     --output text 2>/dev/null); do
@@ -169,16 +181,6 @@ for PA in $(aws iam list-policies --scope Local \
 done
 aws ec2 delete-key-pair --region "$REGION" --key-name "srm-iceberg-ssh-key" 2>/dev/null || true
 echo "  deleted EC2 keypair srm-iceberg-ssh-key (if present)"
-
-# --- 7. terraform destroy (CDP env+DL+cred + VPC+SG+IAM+keypair+S3+data-bucket) --------------
-# `terraform init` first — the module ref can drift between rebuilds and destroy aborts with
-# "Module source has changed" until re-init'd (hit live 2026-09-09). Destroy is idempotent: if a
-# run stops partway on a stray dependency, fix it and just re-run — it resumes from the remainder.
-echo "== terraform init + destroy =="
-( cd "$TF" && terraform init -input=false && terraform destroy -auto-approve )
-# Fallback if destroy stalls on the CDP env (CDW/DH residue): uncomment, run, then re-run destroy:
-#   cdp environments delete-environment --cascade --environment-name "$ENV_NAME"
-#   ( cd "$TF" && terraform state rm $(terraform state list | grep -E 'cdp_(environment|datalake)') )
 
 # out-of-band buckets terraform doesn't own (e.g. srm-iceberg-emr-*) survive destroy — remove them.
 for B in $(aws s3api list-buckets --query 'Buckets[?starts_with(Name,`srm-iceberg-`)].Name' --output text); do
