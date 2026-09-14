@@ -1,213 +1,245 @@
 #!/usr/bin/env bash
-# Full teardown of the srm-iceberg sandbox — run BY HAND before the Friday reaper for a true
-# clean-slate Monday redeploy (#268). Symmetric to redeploy.sh + `terraform apply`.
+# Full teardown of the srm-iceberg sandbox. Idempotent and independent of terraform state:
+# CDP objects are removed with the cdp CLI, AWS leftovers with the aws CLI by name/tag, and
+# terraform destroys only what its state actually owns. Ends with a VERIFY block that exits 1
+# if anything named srm-iceberg remains — so a wrapper can never proceed on a dirty account.
 #
-# Removes EVERYTHING: Trino VW + Database Catalog + CDW cluster, the Impala Data Hub, the CDP
-# environment + DataLake, the VPC + security groups + IAM + keypair + S3 (via terraform destroy),
-# the out-of-band bastion EC2 + its SG, and local SOCKS/cred state on the Mac.
+# Order and why:
+#   1. CDW (VWs -> connectors -> non-default DBCs -> cluster) and Data Hubs: the control plane
+#      refuses an environment delete while either is attached.
+#   2. Bastion EC2 + SG: out-of-band, lives in a terraform-managed subnet.
+#   3. `cdp environments delete-environment --cascading --forced`, wait until gone: CDP tears
+#      down DataLake -> RDS -> NLB -> ENI -> EC2 in its own order, with the IAM roles intact.
+#   4. terraform: drop the env/datalake/idbroker addresses from state (CDP already deleted
+#      them), then `destroy` the AWS shell + credential + groups it owns (seconds).
+#   5. Orphan sweep by name/tag (covers a foreign or empty state): EC2, NLB/target groups,
+#      RDS, ENI, IAM, keypair, S3, CDP credential + groups, and the VPC itself.
+#   6. Reconcile: if nothing is live but state still lists resources, drop them from state.
+#   7. VERIFY, exit 1 on anything left.
 #
-# WHY THIS ORDER: CDW (EKS) and the Data Hubs are NOT in terraform state, and the CDP control plane
-# BLOCKS an environment delete while any Data Hub / CDW cluster is still attached. So the CDP-side
-# objects are torn down via `cdp` CLI FIRST; only then does `terraform destroy` (which owns the CDP
-# env+DL+cross-acct cred + VPC + SGs + IAM + keypair + S3) succeed. S3 must be emptied before
-# destroy or the bucket delete fails. Bastion + its SG are raw `aws ec2` and go last.
-#
-# NOTE: intentionally NOT `set -e` — teardown is best-effort; a 404 on an already-gone object must
-# not abort the rest. Every destructive call is `|| true`; the final VERIFY block is the done-check.
-#
-# UNATTENDED: set TEARDOWN_UNATTENDED=1 to skip the interactive confirmation gate (used by
-# monday-redeploy.sh). Interactive default is unchanged.
+# Usage:  bash teardown.sh                    # typed confirmation gate
+#         TEARDOWN_UNATTENDED=1 bash teardown.sh
 set -uo pipefail
-export PATH="$HOME/.venvs/cdpcli/bin:$PATH"
-export AWS_PROFILE="${AWS_PROFILE:-cldr-se}"
-REGION="${AWS_REGION:-us-east-2}"
-DEMO="$HOME/Documents/GitHub/iceberg-rest-catalog-demo"
-TF="$HOME/Documents/GitHub/cdp-tf-quickstarts/aws"
-ENV_NAME="srm-iceberg-cdp-env"
+. "$(dirname "$0")/common.sh"
 
-# --- 1. prereqs + confirmation gate --------------------------------------------------------
-command -v cdp >/dev/null || { echo "cdp CLI not on PATH (need ~/.venvs/cdpcli)"; exit 1; }
-aws sts get-caller-identity >/dev/null 2>&1 || { echo "AWS creds invalid — run: aws sso login --profile $AWS_PROFILE"; exit 1; }
-cdp environments list-environments >/dev/null 2>&1 || { echo "cdp not authed — run: cdp configure"; exit 1; }
-TEARDOWN_UNATTENDED="${TEARDOWN_UNATTENDED:-0}"
-if [ "$TEARDOWN_UNATTENDED" != "1" ]; then
-  echo "This will PERMANENTLY DESTROY the srm-iceberg env, VPC, S3 data, bastion, and local creds."
+command -v cdp >/dev/null || die "cdp CLI not on PATH (need ~/.venvs/cdpcli)"
+aws sts get-caller-identity >/dev/null 2>&1 || die "AWS SSO expired — run: aws sso login --profile $AWS_PROFILE"
+cdp iam get-user >/dev/null 2>&1 || die "cdp not authenticated — run: cdp configure"
+[ -n "$TERRAFORM" ] && [ -x "$TERRAFORM" ] || die "terraform not found — set TERRAFORM=/path"
+
+if [ "${TEARDOWN_UNATTENDED:-0}" != "1" ]; then
+  echo "This PERMANENTLY DESTROYS the $PREFIX env, VPC, S3 data, bastion, and local creds."
   read -r -p "Type the env name to confirm ($ENV_NAME): " ANS
   [ "$ANS" = "$ENV_NAME" ] || { echo "aborted"; exit 1; }
 fi
+T0=$(date +%s)
+step() { echo; echo "== [$(( ($(date +%s) - T0) / 60 ))m] $* =="; }
 
-# resolve the live env CRN up front (used for CDW match + data-share delete; empty if env already gone)
-ENV_CRN_LIVE=$(cdp environments describe-environment --environment-name "$ENV_NAME" 2>/dev/null | jq -r '.environment.crn // empty')
-
-# --- 2. local SOCKS proxy ------------------------------------------------------------------
-pkill -f "ssh -D 1080" 2>/dev/null && echo "killed ssh -D 1080 SOCKS proxy" || echo "no SOCKS proxy running"
-
-# --- 3. CDW teardown (VWs -> connectors -> non-default DBCs -> cluster) ---------------------
-# Match CDW clusters by environmentCrn, NOT by .name — CDW generates its own cluster name
-# (e.g. "env-kv9zsm") that has nothing to do with the CDP env name. Matching by .name means
-# Error-state orphan clusters from prior sessions are silently skipped (hit live 2026-09-14).
-# Fall back to name pattern only if the env CRN is already gone.
-#
-# CDW delete order (learned live 2026-09-09):
-#   * delete all VWs, wait until none remain;
-#   * delete only NON-default DBCs — the default DBC (name ends in "-default") CANNOT be deleted
-#     directly (500 "only default catalog"); `delete-cluster` removes it. delete-cluster ALSO 400s
-#     ("DB Catalog(s) associated") while a non-default DBC is still mid-delete, so wait it out;
-#   * then delete-cluster, retried a few times to ride out the brief post-DBC-delete 400 window.
-if [ -n "${ENV_CRN_LIVE:-}" ]; then
-  CIDS=$(cdp dw list-clusters | jq -r --arg crn "$ENV_CRN_LIVE" \
-    '.clusters[]? | select(.environmentCrn==$crn) | .id')
-else
-  # env already gone — fall back to name pattern
-  CIDS=$(cdp dw list-clusters | jq -r '.clusters[]? | select(.name|contains("srm-iceberg")) | .id')
-fi
-
-if [ -n "${CIDS:-}" ]; then
-  for CID in $CIDS; do
-    echo "== CDW cluster $CID =="
-    for VID in $(cdp dw list-vws --cluster-id "$CID" | jq -r '.vws[]?.id'); do
-      echo "  delete-vw $VID"; cdp dw delete-vw --cluster-id "$CID" --vw-id "$VID" || true
-    done
-    while [ "$(cdp dw list-vws --cluster-id "$CID" 2>/dev/null | jq '.vws|length')" != "0" ]; do echo "  ...waiting VWs"; sleep 20; done
-    # connectors (auto-created iceberg + hive connectors ride in with the Trino VW; delete-cluster
-    # 500s "connector(s) associated" while any remain — learned live 2026-09-09).
-    for KID in $(cdp dw list-connectors --cluster-id "$CID" | jq -r '.connectors[]?.id'); do
-      echo "  delete-connector $KID"; cdp dw delete-connector --cluster-id "$CID" --connector-id "$KID" || true
-    done
-    # non-default DBCs only (skip the *-default catalog — delete-cluster reaps it)
-    for DID in $(cdp dw list-dbcs --cluster-id "$CID" | jq -r '.dbcs[]? | select(.name|endswith("-default")|not) | .id'); do
-      echo "  delete-dbc $DID"; cdp dw delete-dbc --cluster-id "$CID" --dbc-id "$DID" || true
-    done
-    while [ "$(cdp dw list-dbcs --cluster-id "$CID" 2>/dev/null | jq '[.dbcs[]? | select(.name|endswith("-default")|not)] | length')" != "0" ]; do echo "  ...waiting non-default DBCs"; sleep 20; done
-    echo "  delete-cluster $CID"
-    ACCEPTED=0
-    for i in $(seq 1 10); do
-      if cdp dw delete-cluster --cluster-id "$CID" 2>/dev/null; then ACCEPTED=1; break; fi
-      echo "  ...delete-cluster not accepted yet (retry $i/10)"; sleep 20
-    done
-    if [ "$ACCEPTED" = "1" ]; then
-      while cdp dw list-clusters | jq -e --arg c "$CID" '.clusters[]?|select(.id==$c)' >/dev/null 2>&1; do echo "  ...waiting CDW cluster"; sleep 30; done
-      echo "  CDW cluster $CID gone (EKS + internal NLB + worker SGs removed with it)"
-    else
-      echo "  !! delete-cluster still refused after 10 retries — inspect: cdp dw list-dbcs --cluster-id $CID"
-      echo "     continuing best-effort; the env delete in step 7 will block until CDW is fully gone."
-    fi
+# --- 1. CDW + Data Hubs ------------------------------------------------------------------
+step "CDW clusters"
+pkill -f "ssh -D 1080" 2>/dev/null && echo "  killed SOCKS proxy" || true
+for CID in $(cdw_cluster_ids); do
+  echo "  cluster $CID"
+  for VID in $(cdp dw list-vws --cluster-id "$CID" | jq -r '.vws[]?.id'); do
+    echo "    delete-vw $VID"; cdp dw delete-vw --cluster-id "$CID" --vw-id "$VID" >/dev/null 2>&1 || true
   done
-else
-  echo "== no CDW cluster for $ENV_NAME =="
-fi
-
-# --- 4. Data Hubs (srm-iceberg-impala; srm-hol-optimizer if the HOL was left up) ------------
-for DH in srm-iceberg-impala srm-hol-optimizer; do
-  if cdp datahub describe-cluster --cluster-name "$DH" >/dev/null 2>&1; then
-    echo "delete data hub $DH"; cdp datahub delete-cluster --cluster-name "$DH" || true
+  while [ "$(cdp dw list-vws --cluster-id "$CID" 2>/dev/null | jq '.vws|length')" != "0" ]; do echo "    ...waiting VWs"; sleep 20; done
+  for KID in $(cdp dw list-connectors --cluster-id "$CID" 2>/dev/null | jq -r '.connectors[]?.id'); do
+    echo "    delete-connector $KID"; cdp dw delete-connector --cluster-id "$CID" --connector-id "$KID" >/dev/null 2>&1 || true
+  done
+  for DID in $(cdp dw list-dbcs --cluster-id "$CID" | jq -r '.dbcs[]? | select(.name|endswith("-default")|not) | .id'); do
+    echo "    delete-dbc $DID"; cdp dw delete-dbc --cluster-id "$CID" --dbc-id "$DID" >/dev/null 2>&1 || true
+  done
+  while [ "$(cdp dw list-dbcs --cluster-id "$CID" 2>/dev/null | jq '[.dbcs[]? | select(.name|endswith("-default")|not)] | length')" != "0" ]; do echo "    ...waiting DBCs"; sleep 20; done
+  ACCEPTED=0
+  for i in $(seq 1 10); do
+    if cdp dw delete-cluster --cluster-id "$CID" >/dev/null 2>&1; then ACCEPTED=1; break; fi
+    echo "    delete-cluster not accepted yet ($i/10)"; sleep 20
+  done
+  if [ "$ACCEPTED" = "1" ]; then
+    while cdp dw list-clusters | jq -e --arg c "$CID" '.clusters[]?|select(.id==$c)' >/dev/null 2>&1; do echo "    ...waiting cluster"; sleep 30; done
+    echo "    cluster $CID gone"
+  else
+    echo "  !! delete-cluster $CID refused 10 times — the env delete below will fail; inspect: cdp dw list-dbcs --cluster-id $CID"
   fi
 done
-for DH in srm-iceberg-impala srm-hol-optimizer; do
-  while cdp datahub describe-cluster --cluster-name "$DH" >/dev/null 2>&1; do echo "  ...waiting DH $DH"; sleep 30; done
+
+step "Data Hubs"
+for DH in $(datahubs_present); do echo "  delete $DH"; cdp datahub delete-cluster --cluster-name "$DH" >/dev/null 2>&1 || true; done
+for DH in $DATAHUBS; do
+  while cdp datahub describe-cluster --cluster-name "$DH" >/dev/null 2>&1; do echo "  ...waiting $DH"; sleep 30; done
 done
 
-# --- 5. DataShare (best-effort; the env delete cascades this too) ---------------------------
-[ -f "$DEMO/config.env" ] && . "$DEMO/config.env"
-ENV_CRN="${ENV_CRN:-$ENV_CRN_LIVE}"   # prefer config.env, fall back to the live lookup
-if [ -n "${DL_CRN:-}" ] && [ -n "${ENV_CRN:-}" ] && [ -n "${DATA_SHARE_ID:-}" ]; then
-  cdp datacatalog delete-data-share --datalake-crn "$DL_CRN" --environment-crn "$ENV_CRN" --data-share-id "$DATA_SHARE_ID" 2>/dev/null \
-    && echo "deleted data share $DATA_SHARE_ID" || echo "data share already gone / cascades with env"
-fi
-
-# --- 6. bastion — MUST run BEFORE terraform destroy (out-of-band, not in TF state) ----------
-# The bastion EC2 sits in a TF-managed public subnet; leaving it up makes `terraform destroy`
-# abort with DependencyViolation on that subnet (hit live 2026-09-09). Terminate it + its SG
-# first so the VPC/subnet teardown is unblocked. (No manual S3 pre-empty: the data bucket is
-# force_destroy=true, so terraform empties+deletes it during destroy.)
-BID=$(aws ec2 describe-instances --region "$REGION" \
-  --filters "Name=tag:Name,Values=srm-iceberg-bastion" "Name=instance-state-name,Values=running,stopped,stopping,pending" \
-  --query 'Reservations[].Instances[].InstanceId' --output text)
+# --- 2. bastion --------------------------------------------------------------------------
+step "bastion"
+BID=$(aws ec2 describe-instances --region "$REGION" --filters "Name=tag:Name,Values=$BASTION_NAME" "Name=instance-state-name,Values=pending,running,stopping,stopped" --query 'Reservations[].Instances[].InstanceId' --output text)
 if [ -n "$BID" ]; then
-  echo "terminate bastion $BID"; aws ec2 terminate-instances --region "$REGION" --instance-ids $BID >/dev/null
+  echo "  terminate $BID"; aws ec2 terminate-instances --region "$REGION" --instance-ids $BID >/dev/null
   aws ec2 wait instance-terminated --region "$REGION" --instance-ids $BID
 fi
-BSG=$(aws ec2 describe-security-groups --region "$REGION" --filters "Name=group-name,Values=srm-iceberg-bastion-sg" --query 'SecurityGroups[0].GroupId' --output text 2>/dev/null)
-[ -n "$BSG" ] && [ "$BSG" != "None" ] && { echo "delete bastion SG $BSG"; aws ec2 delete-security-group --region "$REGION" --group-id "$BSG" || true; }
+BSG=$(aws ec2 describe-security-groups --region "$REGION" --filters "Name=group-name,Values=$BASTION_SG" --query 'SecurityGroups[0].GroupId' --output text 2>/dev/null)
+[ -n "$BSG" ] && [ "$BSG" != "None" ] && { echo "  delete SG $BSG"; aws ec2 delete-security-group --region "$REGION" --group-id "$BSG" >/dev/null 2>&1 || true; }
 
-# --- 7. terraform destroy (CDP env+DL+cred + VPC+SG+IAM+keypair+S3+data-bucket) --------------
-# `terraform init` first — the module ref can drift between rebuilds and destroy aborts with
-# "Module source has changed" until re-init'd (hit live 2026-09-09). Destroy is idempotent: if a
-# run stops partway on a stray dependency, fix it and just re-run — it resumes from the remainder.
-# IMPORTANT: IAM purge (step 7b) runs AFTER this, not before. The CDP control plane needs
-# sts:AssumeRole on srm-iceberg-xaccount-role during DataLake deletion (describeAlarms etc.).
-# Deleting IAM before destroy causes DELETE_FAILED on the DataLake (hit live 2026-09-14).
-echo "== terraform init + destroy =="
-( cd "$TF" && terraform init -input=false && terraform destroy -auto-approve )
-# Fallback if destroy stalls on the CDP env (CDW/DH residue): uncomment, run, then re-run destroy:
-#   cdp environments delete-environment --cascade --environment-name "$ENV_NAME"
-#   ( cd "$TF" && terraform state rm $(terraform state list | grep -E 'cdp_(environment|datalake)') )
-
-# --- 7b. post-destroy IAM + keypair purge --------------------------------------------------
-# Runs AFTER terraform destroy so the CDP control plane still has the xaccount role during
-# DataLake deletion. When tfstate was already empty, destroy is a no-op and IAM resources from
-# the last apply remain — this purge catches them so the next `terraform apply` doesn't fail
-# EntityAlreadyExists. || true throughout — best-effort teardown.
-echo "== post-terraform IAM + keypair purge =="
-for IP in $(aws iam list-instance-profiles \
-    --query 'InstanceProfiles[?starts_with(InstanceProfileName,`srm-iceberg-`)].InstanceProfileName' \
-    --output text 2>/dev/null); do
-  for R in $(aws iam get-instance-profile --instance-profile-name "$IP" \
-      --query 'InstanceProfile.Roles[].RoleName' --output text 2>/dev/null); do
-    aws iam remove-role-from-instance-profile --instance-profile-name "$IP" --role-name "$R" 2>/dev/null || true
+# --- 3. CDP environment (cascading) ------------------------------------------------------
+step "CDP environment"
+if [ -n "$(env_crn)" ]; then
+  echo "  delete-environment --cascading --forced $ENV_NAME"
+  cdp environments delete-environment --environment-name "$ENV_NAME" --cascading --forced >/dev/null 2>&1 || true
+  N=0
+  while [ -n "$(env_crn)" ]; do
+    N=$((N+1)); [ $N -gt 90 ] && { echo "  !! env still present after 45 min"; break; }
+    echo "  ...$(cdp environments describe-environment --environment-name "$ENV_NAME" 2>/dev/null | jq -r '.environment.status // "?"')"; sleep 30
   done
-  aws iam delete-instance-profile --instance-profile-name "$IP" 2>/dev/null || true
-  echo "  deleted instance-profile $IP"
-done
-for ROLE in $(aws iam list-roles \
-    --query 'Roles[?starts_with(RoleName,`srm-iceberg-`)].RoleName' \
-    --output text 2>/dev/null); do
-  for PA in $(aws iam list-attached-role-policies --role-name "$ROLE" \
-      --query 'AttachedPolicies[].PolicyArn' --output text 2>/dev/null); do
-    aws iam detach-role-policy --role-name "$ROLE" --policy-arn "$PA" 2>/dev/null || true
-  done
-  for PI in $(aws iam list-role-policies --role-name "$ROLE" \
-      --query 'PolicyNames[]' --output text 2>/dev/null); do
-    aws iam delete-role-policy --role-name "$ROLE" --policy-name "$PI" 2>/dev/null || true
-  done
-  aws iam delete-role --role-name "$ROLE" 2>/dev/null || true
-  echo "  deleted role $ROLE"
-done
-for PA in $(aws iam list-policies --scope Local \
-    --query 'Policies[?starts_with(PolicyName,`srm-iceberg-`)].Arn' \
-    --output text 2>/dev/null); do
-  aws iam delete-policy --policy-arn "$PA" 2>/dev/null || true
-  echo "  deleted policy $PA"
-done
-aws ec2 delete-key-pair --region "$REGION" --key-name "srm-iceberg-ssh-key" 2>/dev/null || true
-echo "  deleted EC2 keypair srm-iceberg-ssh-key (if present)"
+  [ -z "$(env_crn)" ] && echo "  env gone"
+else
+  echo "  no env"
+fi
 
-# out-of-band buckets terraform doesn't own (e.g. srm-iceberg-emr-*) survive destroy — remove them.
-for B in $(aws s3api list-buckets --query 'Buckets[?starts_with(Name,`srm-iceberg-`)].Name' --output text); do
-  echo "remove leftover s3://$B"; aws s3 rb "s3://$B" --force >/dev/null 2>&1 || true
+# --- 4. terraform ------------------------------------------------------------------------
+step "terraform destroy (AWS shell + CDP credential/groups owned by state)"
+cd "$TF" || die "missing $TF"
+"$TERRAFORM" init -input=false >/dev/null 2>&1 || echo "  !! terraform init failed"
+for ADDR in $("$TERRAFORM" state list 2>/dev/null | grep -E 'cdp_environments_aws_environment|cdp_datalake_aws_datalake|cdp_environments_id_broker_mappings'); do
+  echo "  state rm $ADDR (deleted by CDP above)"; "$TERRAFORM" state rm "$ADDR" >/dev/null 2>&1 || true
 done
+# the cdp provider errors (instead of forgetting) when a group/credential in state is already gone
+LIVE_GROUPS=$(cdp_groups_present); LIVE_CRED=$(cdp_cred_present)
+for ADDR in $("$TERRAFORM" state list 2>/dev/null | grep -E 'cdp_iam_group|cdp_environments_aws_credential'); do
+  case "$ADDR" in
+    *cdp_iam_group*)  G=$(echo "$ADDR" | sed -n 's/.*\["\(.*\)"\].*/\1/p'); echo "$LIVE_GROUPS" | grep -qx -F "$G" && continue ;;
+    *)                [ -n "$LIVE_CRED" ] && continue ;;
+  esac
+  echo "  state rm $ADDR (already gone)"; "$TERRAFORM" state rm "$ADDR" >/dev/null 2>&1 || true
+done
+if [ "$(tf_state_count)" != "0" ]; then
+  "$TERRAFORM" destroy -auto-approve -input=false || echo "  !! terraform destroy exited non-zero — sweeping leftovers"
+else
+  echo "  state empty, nothing to destroy"
+fi
+cd "$DEMO"
 
-# --- 8. local cleanup ----------------------------------------------------------------------
+# --- 5. orphan sweep (name/tag based, independent of state) -------------------------------
+step "orphan sweep"
+VPC=$(vpc_id)
+if [ -n "$VPC" ]; then
+  echo "  VPC $VPC still exists — clearing what lives in it"
+  IDS=$(aws ec2 describe-instances --region "$REGION" --filters "Name=vpc-id,Values=$VPC" "Name=instance-state-name,Values=pending,running,stopping,stopped" --query 'Reservations[].Instances[].InstanceId' --output text)
+  if [ -n "$IDS" ]; then echo "  terminate EC2: $IDS"; aws ec2 terminate-instances --region "$REGION" --instance-ids $IDS >/dev/null; aws ec2 wait instance-terminated --region "$REGION" --instance-ids $IDS; fi
+  for LB in $(aws elbv2 describe-load-balancers --region "$REGION" --query "LoadBalancers[?VpcId=='$VPC'].LoadBalancerArn" --output text); do
+    echo "  delete LB $LB"
+    aws elbv2 modify-load-balancer-attributes --region "$REGION" --load-balancer-arn "$LB" --attributes Key=deletion_protection.enabled,Value=false >/dev/null 2>&1 || true
+    aws elbv2 delete-load-balancer --region "$REGION" --load-balancer-arn "$LB" >/dev/null 2>&1 || true
+  done
+  for TG in $(aws elbv2 describe-target-groups --region "$REGION" --query "TargetGroups[?VpcId=='$VPC'].TargetGroupArn" --output text); do
+    aws elbv2 delete-target-group --region "$REGION" --target-group-arn "$TG" >/dev/null 2>&1 || true
+  done
+  for DB in $(aws rds describe-db-instances --region "$REGION" --query "DBInstances[?DBSubnetGroup.VpcId=='$VPC'].DBInstanceIdentifier" --output text); do
+    echo "  delete RDS $DB"
+    aws rds modify-db-instance --region "$REGION" --db-instance-identifier "$DB" --no-deletion-protection --apply-immediately >/dev/null 2>&1 || true
+    aws rds delete-db-instance --region "$REGION" --db-instance-identifier "$DB" --skip-final-snapshot --delete-automated-backups >/dev/null 2>&1 || true
+    aws rds wait db-instance-deleted --region "$REGION" --db-instance-identifier "$DB" 2>/dev/null || true
+  done
+  for SG in $(aws rds describe-db-subnet-groups --region "$REGION" --query "DBSubnetGroups[?VpcId=='$VPC'].DBSubnetGroupName" --output text); do
+    aws rds delete-db-subnet-group --region "$REGION" --db-subnet-group-name "$SG" >/dev/null 2>&1 || true
+  done
+  N=0
+  while :; do
+    ENIS=$(aws ec2 describe-network-interfaces --region "$REGION" --filters "Name=vpc-id,Values=$VPC" --query 'NetworkInterfaces[].[NetworkInterfaceId,Status]' --output text)
+    [ -z "$ENIS" ] && break
+    for E in $(echo "$ENIS" | awk '$2=="available"{print $1}'); do aws ec2 delete-network-interface --region "$REGION" --network-interface-id "$E" >/dev/null 2>&1 || true; done
+    N=$((N+1)); [ $N -gt 30 ] && { echo "  !! ENIs still attached after 15 min: $(echo "$ENIS" | tr '\n' ' ')"; break; }
+    echo "  ...waiting ENIs ($(echo "$ENIS" | wc -l | tr -d ' '))"; sleep 30
+  done
+  echo "  delete VPC $VPC"
+  EPS=$(aws ec2 describe-vpc-endpoints --region "$REGION" --filters "Name=vpc-id,Values=$VPC" --query 'VpcEndpoints[].VpcEndpointId' --output text)
+  [ -n "$EPS" ] && aws ec2 delete-vpc-endpoints --region "$REGION" --vpc-endpoint-ids $EPS >/dev/null 2>&1
+  while [ -n "$(aws ec2 describe-vpc-endpoints --region "$REGION" --filters "Name=vpc-id,Values=$VPC" --query 'VpcEndpoints[].VpcEndpointId' --output text)" ]; do echo "  ...waiting endpoints"; sleep 15; done
+  for NAT in $(aws ec2 describe-nat-gateways --region "$REGION" --filter "Name=vpc-id,Values=$VPC" "Name=state,Values=pending,available" --query 'NatGateways[].NatGatewayId' --output text); do
+    aws ec2 delete-nat-gateway --region "$REGION" --nat-gateway-id "$NAT" >/dev/null 2>&1 || true
+    aws ec2 wait nat-gateway-deleted --region "$REGION" --nat-gateway-ids "$NAT" 2>/dev/null || true
+  done
+  for ALLOC in $(aws ec2 describe-addresses --region "$REGION" --filters "Name=tag:Name,Values=$VPC_NAME*" --query 'Addresses[?AssociationId==null].AllocationId' --output text); do
+    aws ec2 release-address --region "$REGION" --allocation-id "$ALLOC" >/dev/null 2>&1 || true
+  done
+  for IGW in $(aws ec2 describe-internet-gateways --region "$REGION" --filters "Name=attachment.vpc-id,Values=$VPC" --query 'InternetGateways[].InternetGatewayId' --output text); do
+    aws ec2 detach-internet-gateway --region "$REGION" --internet-gateway-id "$IGW" --vpc-id "$VPC" >/dev/null 2>&1 || true
+    aws ec2 delete-internet-gateway --region "$REGION" --internet-gateway-id "$IGW" >/dev/null 2>&1 || true
+  done
+  for SN in $(aws ec2 describe-subnets --region "$REGION" --filters "Name=vpc-id,Values=$VPC" --query 'Subnets[].SubnetId' --output text); do
+    aws ec2 delete-subnet --region "$REGION" --subnet-id "$SN" >/dev/null 2>&1 || true
+  done
+  for RT in $(aws ec2 describe-route-tables --region "$REGION" --filters "Name=vpc-id,Values=$VPC" --query 'RouteTables[?Associations[0].Main!=`true`].RouteTableId' --output text); do
+    for A in $(aws ec2 describe-route-tables --region "$REGION" --route-table-ids "$RT" --query 'RouteTables[].Associations[].RouteTableAssociationId' --output text); do
+      aws ec2 disassociate-route-table --region "$REGION" --association-id "$A" >/dev/null 2>&1 || true
+    done
+    aws ec2 delete-route-table --region "$REGION" --route-table-id "$RT" >/dev/null 2>&1 || true
+  done
+  SGS=$(aws ec2 describe-security-groups --region "$REGION" --filters "Name=vpc-id,Values=$VPC" --query "SecurityGroups[?GroupName!='default'].GroupId" --output text)
+  for SG in $SGS; do   # drop cross-references first, then delete
+    ING=$(aws ec2 describe-security-groups --region "$REGION" --group-ids "$SG" --query 'SecurityGroups[0].IpPermissions' --output json)
+    [ "$(echo "$ING" | jq 'length')" != "0" ] && aws ec2 revoke-security-group-ingress --region "$REGION" --group-id "$SG" --ip-permissions "$ING" >/dev/null 2>&1 || true
+    EGR=$(aws ec2 describe-security-groups --region "$REGION" --group-ids "$SG" --query 'SecurityGroups[0].IpPermissionsEgress' --output json)
+    [ "$(echo "$EGR" | jq 'length')" != "0" ] && aws ec2 revoke-security-group-egress --region "$REGION" --group-id "$SG" --ip-permissions "$EGR" >/dev/null 2>&1 || true
+  done
+  for SG in $SGS; do aws ec2 delete-security-group --region "$REGION" --group-id "$SG" >/dev/null 2>&1 || true; done
+  aws ec2 delete-vpc --region "$REGION" --vpc-id "$VPC" >/dev/null 2>&1 && echo "  VPC deleted" || echo "  !! VPC delete refused — see VERIFY"
+else
+  echo "  no VPC"
+fi
+for IP in $(iam_profiles); do
+  for R in $(aws iam get-instance-profile --instance-profile-name "$IP" --query 'InstanceProfile.Roles[].RoleName' --output text 2>/dev/null); do
+    aws iam remove-role-from-instance-profile --instance-profile-name "$IP" --role-name "$R" >/dev/null 2>&1 || true
+  done
+  aws iam delete-instance-profile --instance-profile-name "$IP" >/dev/null 2>&1 && echo "  deleted instance profile $IP"
+done
+for ROLE in $(iam_roles); do
+  for PA in $(aws iam list-attached-role-policies --role-name "$ROLE" --query 'AttachedPolicies[].PolicyArn' --output text 2>/dev/null); do
+    aws iam detach-role-policy --role-name "$ROLE" --policy-arn "$PA" >/dev/null 2>&1 || true
+  done
+  for PI in $(aws iam list-role-policies --role-name "$ROLE" --query 'PolicyNames[]' --output text 2>/dev/null); do
+    aws iam delete-role-policy --role-name "$ROLE" --policy-name "$PI" >/dev/null 2>&1 || true
+  done
+  aws iam delete-role --role-name "$ROLE" >/dev/null 2>&1 && echo "  deleted role $ROLE"
+done
+for PA in $(iam_policies); do
+  for V in $(aws iam list-policy-versions --policy-arn "$PA" --query 'Versions[?IsDefaultVersion==`false`].VersionId' --output text 2>/dev/null); do
+    aws iam delete-policy-version --policy-arn "$PA" --version-id "$V" >/dev/null 2>&1 || true
+  done
+  aws iam delete-policy --policy-arn "$PA" >/dev/null 2>&1 && echo "  deleted policy $PA"
+done
+[ -n "$(keypair_present)" ] && aws ec2 delete-key-pair --region "$REGION" --key-name "$KEYPAIR" >/dev/null 2>&1 && echo "  deleted keypair $KEYPAIR"
+for B in $(s3_buckets); do echo "  remove s3://$B"; aws s3 rb "s3://$B" --force >/dev/null 2>&1 || true; done
+[ -n "$(cdp_cred_present)" ] && cdp environments delete-credential --credential-name "$CRED_NAME" >/dev/null 2>&1 && echo "  deleted CDP credential $CRED_NAME"
+for G in $(cdp_groups_present); do cdp iam delete-group --group-name "$G" >/dev/null 2>&1 && echo "  deleted CDP group $G"; done
+
+# --- 6. state reconcile + local files ---------------------------------------------------
+step "reconcile"
+LIVE="$(env_crn)$(vpc_id)$(iam_roles)$(iam_policies)$(iam_profiles)$(keypair_present)$(s3_buckets)$(ec2_instances)$(cdp_cred_present)$(cdp_groups_present)"
+if [ -z "$LIVE" ] && [ "$(tf_state_count)" != "0" ]; then
+  echo "  nothing live but state lists $(tf_state_count) resources — dropping them from state (backup: terraform.tfstate.backup)"
+  ( cd "$TF" && "$TERRAFORM" state rm $("$TERRAFORM" state list) >/dev/null 2>&1 || true )
+fi
 rm -f "$DEMO/config.env" "$DEMO/credentials.json" "$DEMO/credentials-nifi.json"
-# NOTE: the SSH .pem is a terraform resource (local_sensitive_file.pem_file) and is removed by
-# destroy above; Monday's `terraform apply` regenerates it. .workload.creds + tfstate are kept.
-echo "removed local config.env + credentials*.json (.workload.creds + tfstate kept; ssh .pem regenerates on apply)"
-grep -q "dw-srm-iceberg-cdp-env" /etc/hosts 2>/dev/null && echo "WARN: stale *.dw-srm-iceberg lines in /etc/hosts — remove by hand (needs sudo)" || true
-echo "REMINDER: disable/clear the FoxyProxy SOCKS entry in the browser (manual)."
+echo "  removed local config.env + credentials*.json (.workload.creds kept)"
+grep -q "dw-$ENV_NAME" /etc/hosts 2>/dev/null && echo "  note: stale *.dw-$ENV_NAME lines in /etc/hosts (manual, sudo)"
 
-# --- 9. verify -----------------------------------------------------------------------------
-echo "== VERIFY =="
-cdp environments list-environments | jq -r '.environments[]?.environmentName' | grep -q srm-iceberg \
-  && echo "  env STILL PRESENT (destroy may still be finishing)" || echo "  CDP env gone"
-( cd "$TF" && [ "$(terraform state list | wc -l | tr -d ' ')" = "0" ] && echo "  terraform state empty" || echo "  terraform state NOT empty — inspect" )
-aws s3api list-buckets --query 'Buckets[?starts_with(Name,`srm-iceberg-`)].Name' --output text | grep -q . \
-  && echo "  S3 buckets remain" || echo "  S3 buckets gone"
-aws ec2 describe-vpcs --region "$REGION" --filters "Name=tag:Name,Values=srm-iceberg-net" --query 'Vpcs[].VpcId' --output text | grep -q . \
-  && echo "  VPC remains" || echo "  VPC gone"
-aws ec2 describe-instances --region "$REGION" --filters "Name=tag:Name,Values=srm-iceberg-bastion" "Name=instance-state-name,Values=running,stopped,stopping,pending" --query 'Reservations[].Instances[].InstanceId' --output text | grep -q . \
-  && echo "  bastion remains" || echo "  bastion gone"
-aws iam list-roles --query 'Roles[?starts_with(RoleName,`srm-iceberg-`)].RoleName' --output text | grep -q . \
-  && echo "  IAM roles remain — check above output" || echo "  IAM roles gone"
-aws ec2 describe-key-pairs --region "$REGION" --filters "Name=key-name,Values=srm-iceberg-ssh-key" --query 'KeyPairs[].KeyName' --output text | grep -q . \
-  && echo "  EC2 keypair remains" || echo "  EC2 keypair gone"
-echo "== TEARDOWN COMPLETE =="
+# --- 7. verify ---------------------------------------------------------------------------
+step "VERIFY"
+BAD=0
+chk() { if [ -z "$2" ]; then echo "  gone     $1"; else echo "  REMAINS  $1: $(echo "$2" | tr '\n' ' ')"; BAD=1; fi; }
+chk "CDP env"            "$(env_crn)"
+chk "CDP credential"     "$(cdp_cred_present)"
+chk "CDP groups"         "$(cdp_groups_present)"
+chk "Data Hubs"          "$(datahubs_present)"
+chk "CDW clusters"       "$(cdw_cluster_ids)"
+chk "VPC $VPC_NAME"      "$(vpc_id)"
+chk "IAM roles"          "$(iam_roles)"
+chk "IAM policies"       "$(iam_policies)"
+chk "IAM profiles"       "$(iam_profiles)"
+chk "EC2 keypair"        "$(keypair_present)"
+chk "S3 buckets"         "$(s3_buckets)"
+chk "EC2 instances"      "$(ec2_instances)"
+N=$(tf_state_count); [ "$N" = "0" ] && echo "  gone     terraform state" || { echo "  REMAINS  terraform state: $N resources"; BAD=1; }
+echo
+if [ "$BAD" = "0" ]; then echo "== TEARDOWN COMPLETE ($(( ($(date +%s) - T0) / 60 )) min) =="; exit 0; fi
+echo "== TEARDOWN INCOMPLETE — fix the REMAINS lines above and re-run =="; exit 1

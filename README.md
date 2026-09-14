@@ -55,7 +55,11 @@ read datashare: they route through Impala, the authoritative HMS Iceberg writer
 | Path | What it is |
 | :-- | :-- |
 | `test-rest-catalog.sh` | **Start here.** Read-only validation: JWT exchange → list namespaces → list tables → load a table (shows vended-cred keys). Never modifies CDP. |
-| `redeploy.sh` | Full unattended rebuild of everything a weekly reaper destroys — env + DataLake + Impala Data Hub, seed tables, enable REST Catalog, create external users, share tables, validate (~1h40m). |
+| `monday-redeploy.sh` | **The weekly rebuild, one command.** Bumps `enddate`, runs `teardown.sh` → `preflight.sh` → `redeploy.sh` → the Trino VW playbook from [`trino-demo`](https://github.com/cldr-steven-matison/trino-demo), verifies both, logs to `monday-redeploy-<date>.log`. Linux deploy host. |
+| `teardown.sh` | Full, idempotent wipe of everything named `srm-iceberg` — CDW, Data Hubs, the CDP env (cascading), the terraform-owned AWS shell, then an orphan sweep by name/tag. Exits 1 if anything remains. |
+| `preflight.sh` | Read-only gate before `terraform apply`: tooling, auth, tfvars, empty terraform state, and zero `srm-iceberg` leftovers in CDP or AWS. |
+| `redeploy.sh` | Rebuild on an empty account — env + DataLake + Impala Data Hub, seed tables, enable REST Catalog, create external users, share tables, validate (~1h40m). |
+| `common.sh` | Names, paths, and lookups shared by the scripts above. |
 | `seed-impala.py` | Seed an Iceberg table into HMS via Impala over Knox (LDAP workload auth). |
 | `sql/` | Table DDL + seed data: `airlines` (3 rows), `flights` (120k rows, 12 monthly partitions for manifest-pruning demos), `nifi_sink`. |
 | `k8s/` | OSS Spark reading the REST Catalog as a Kubernetes `Job` (`apache/spark:3.5.3`). |
@@ -68,8 +72,9 @@ read datashare: they route through Impala, the authoritative HMS Iceberg writer
 - A CDP Public Cloud environment on **Runtime 7.3.2** with a `LIGHT_DUTY` DataLake and an **Impala
   Data Hub**, the REST Catalog enabled, and a **data share** activated for an external user.
   `redeploy.sh` builds all of this from a `cdp-tf-quickstarts` Terraform base.
-- CLI tools: `curl`, `jq`, `python3` with `impyla` (for `seed-impala.py`), and `aws` + `cdp` CLIs
-  for `redeploy.sh`.
+- CLI tools: `curl`, `jq`, `python3` with `impyla` (for `seed-impala.py`), `terraform` ≥ 1.16, and
+  `aws` + `cdp` CLIs for `redeploy.sh` / `teardown.sh`. The Trino leg of `monday-redeploy.sh` needs
+  the `~/.venvs/clouderacloud` venv from the `trino-demo` README.
 - **Credentials you supply locally (all gitignored — never committed):**
   - `credentials.json` — the external user's REST-catalog OAuth client: `{ "clientId", "secret", "username" }`.
   - `.workload.creds` — a one-line CDP **workload password** (for Impala LDAP), or set `$WORKLOAD_PASSWORD`.

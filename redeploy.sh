@@ -5,33 +5,23 @@
 # REST Catalog, creates two external users (iceberg-consumer for Spark/Athena/etc.,
 # iceberg-consumer-nifi for the NiFi flow), shares BOTH tables to BOTH users, activates,
 # validates, and (best-effort) re-wires the surviving minikube NiFi flow's OAuth creds.
-# ~1h40m wall-clock, mostly unattended polling.
+# ~1h40m wall-clock, mostly unattended polling. Assumes an empty account (preflight.sh).
 #
-# MANUAL PREREQS (interactive — do these first, once):
+# MANUAL PREREQS (interactive):
 #   aws sso login --profile cldr-se
 #   cdp configure                       # only if the CDP API key was rotated/deleted
 #   ~/Documents/GitHub/iceberg-rest-catalog-demo/.workload.creds must exist (workload password)
 #
-# The NiFi re-wire (step 8) is best-effort: it only runs if the iceberg-lab minikube profile
-# is up with a nifi-client helper pod in cfm-streaming. Otherwise it prints manual steps and
-# the AWS rebuild still completes cleanly.
+# Step 8 (re-wire a local minikube NiFi flow with the fresh creds) runs only with NIFI_REWIRE=1.
 #
-# Usage:  bash redeploy.sh
+# Usage:  bash redeploy.sh          # run preflight.sh first; monday-redeploy.sh does both
 set -euo pipefail
-export AWS_PROFILE=cldr-se
-export PATH="$HOME/.venvs/cdpcli/bin:$PATH"
-
-TF="$HOME/Documents/GitHub/cdp-tf-quickstarts/aws"
-DEMO="$HOME/Documents/GitHub/iceberg-rest-catalog-demo"
-PREFIX="srm-iceberg"
-ENV_NAME="${PREFIX}-cdp-env"
-DL="${PREFIX}-aw-dl"
-DH="${PREFIX}-impala"
-GW="${PREFIX}-aw-dl-gateway.srm-iceb.a465-9q4k.cloudera.site"   # stable for this tenant+prefix
-USER_NAME="steven.matison"
+. "$(dirname "$0")/common.sh"
+DL="$DL_NAME"
+DH="$DH_NAME"
 
 echo "== [1/8] terraform apply (env + DataLake) — ~1h20m =="
-( cd "$TF" && terraform init -input=false >/dev/null && terraform apply -auto-approve )
+( cd "$TF" && "$TERRAFORM" init -input=false >/dev/null && "$TERRAFORM" apply -auto-approve -input=false )
 
 echo "== [2/8] wait for DataLake RUNNING =="
 until [ "$(cdp datalake describe-datalake --datalake-name "$DL" 2>/dev/null | jq -r '.datalake.status')" = RUNNING ]; do sleep 30; done
@@ -109,12 +99,14 @@ echo "== [7/8] validate REST Catalog (4-step) — airlines + flights =="
 bash test-rest-catalog.sh poc_uc2 airlines
 bash test-rest-catalog.sh poc_uc2 flights || echo "   (flights validation non-fatal here; Ranger can lag ~15-45s after share)"
 
-echo "== [8/8] re-wire the surviving minikube NiFi flow's OAuth creds (best-effort) =="
-# The NiFi flow (PG IcebergRESTCatalogDemo) survives on minikube, but its Parameter Context still
-# holds the PRE-reaper clientId/secret -> 401 until updated to the fresh iceberg-consumer-nifi creds.
-# Only runs if the iceberg-lab profile is up with the nifi-client helper pod; never fails the rebuild.
+echo "== [8/8] re-wire a local minikube NiFi flow's OAuth creds (only with NIFI_REWIRE=1) =="
+# The NiFi flow (PG IcebergRESTCatalogDemo) keeps the previous clientId/secret in its Parameter
+# Context -> 401 until updated to the fresh iceberg-consumer-nifi creds. Opt-in: it needs the
+# iceberg-lab minikube profile with the nifi-client helper pod, and never runs against another NiFi.
 NIFI_NS=cfm-streaming
-if kubectl -n "$NIFI_NS" get pod nifi-client >/dev/null 2>&1; then
+if [ "${NIFI_REWIRE:-0}" != "1" ]; then
+  echo "   skipped (set NIFI_REWIRE=1 to run it). Fresh NiFi creds: $DEMO/credentials-nifi.json"
+elif kubectl -n "$NIFI_NS" get pod nifi-client >/dev/null 2>&1; then
   CID_N=$(jq -r '.clientId' "$DEMO/credentials-nifi.json")
   SEC_N=$(jq -r '.secret'   "$DEMO/credentials-nifi.json")
   kubectl -n "$NIFI_NS" cp "$DEMO/nifi/rewire-nifi-creds.sh" nifi-client:/tmp/rewire-nifi-creds.sh
