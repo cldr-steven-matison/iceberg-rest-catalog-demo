@@ -33,4 +33,4 @@ the path just works.
   `bastion-up.sh` refreshes it each run.
 - **Cost** — `t3.small` ≈ $0.02/hr; `--stop` when idle.
 
-Full write-up + live IDs: `DesktopShare/cloudera-iceberg-rest-catalog-aws-plan.md` §External / VPC access.
+Full write-up + live IDs: `BrainShare/cloudera-iceberg-rest-catalog-aws-plan.md` §External / VPC access.

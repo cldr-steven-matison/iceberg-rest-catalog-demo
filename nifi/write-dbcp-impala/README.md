@@ -23,7 +23,7 @@ Impala API (impala.py):  create table (STORED BY ICEBERG)  +  verify count(*)   
 The REST datashare only vends **read-only** S3 creds, and a `HadoopCatalogService` would write
 by S3 directory convention into a table Impala can't see (catalog mismatch). Routing the write
 through Impala's JDBC endpoint sidesteps both: Impala is the authoritative HMS Iceberg writer.
-Full rationale: `DesktopShare/cloudera-impala-iceberg-plan.md`.
+Full rationale: `BrainShare/cloudera-impala-iceberg-plan.md`.
 
 ## Files
 
