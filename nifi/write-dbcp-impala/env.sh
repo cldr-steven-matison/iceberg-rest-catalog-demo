@@ -3,7 +3,7 @@
 # the workload password is read at runtime from ../../.workload.creds.
 
 # --- CDP Impala Data Hub (7.3.2) over Knox, LDAP HTTP transport ---
-IMPALA_HOST="srm-iceberg-impala-master0.srm-iceb.a465-9q4k.cloudera.site"
+IMPALA_HOST="srm-iceberg-impala-gateway.srm-iceb.a465-9q4k.cloudera.site"  # Knox gateway (public); master0 is a private IP, unreachable from the pod
 IMPALA_PORT="443"                                   # Knox HTTPS (not the native 21050)
 IMPALA_HTTPPATH="srm-iceberg-impala/cdp-proxy-api/impala"
 WORKLOAD_USER="steven.matison"                      # password: ../../.workload.creds

@@ -18,3 +18,10 @@ __pycache__/
 
 # Logs
 *.log
+
+# macOS
+.DS_Store
+# Local NiFi runtime state (certs, client config, flow backups — not for VCS)
+nifi/write-native/trust/
+nifi/write-native/cdp-conf/
+nifi/write-native/flow-backups/
