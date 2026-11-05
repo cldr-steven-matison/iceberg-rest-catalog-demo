@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# One-command weekly rebuild of the srm-iceberg sandbox (Linux deploy host):
+# One-command weekly rebuild of the srm-iceberg sandbox (Linux or macOS deploy host):
 #   bump enddate -> teardown.sh -> preflight.sh -> redeploy.sh -> Trino VW playbook -> verify.
 # Stops at the first failing leg. Everything is logged to monday-redeploy-<date>.log.
 #
@@ -11,11 +11,13 @@ cd "$DEMO"
 LOG="$DEMO/monday-redeploy-$(date +%F-%H%M).log"
 exec > >(tee -a "$LOG") 2>&1
 T0=$(date +%s)
+command -v caffeinate >/dev/null && { caffeinate -dims -w $$ & }   # macOS: no sleep while this runs
+export OBJC_DISABLE_INITIALIZE_FORK_SAFETY=YES                     # macOS: ansible workers fork after ObjC init
 leg() { echo; echo "== [$(( ($(date +%s) - T0) / 60 ))m] $* =="; }
 
 leg "enddate -> coming Friday"
-END=$(date -d 'next friday' +%F)
-sed -i -E "s/(enddate *= *\")[0-9-]+(\")/\1$END\2/" "$TF/terraform.tfvars"
+END=$(date -d 'next friday' +%F 2>/dev/null || date -v+1d -v+fri +%F)   # GNU, then BSD (macOS)
+sed -E -i.bak "s/(enddate *= *\")[0-9-]+(\")/\1$END\2/" "$TF/terraform.tfvars" && rm -f "$TF/terraform.tfvars.bak"
 grep -o 'enddate *= *"[0-9-]*"' "$TF/terraform.tfvars"
 
 leg "leg 0: teardown"

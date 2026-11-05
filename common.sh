@@ -14,7 +14,9 @@ CC_VENV="$HOME/.venvs/clouderacloud"          # ansible + cloudera.cloud (Trino-
 
 # One terraform binary for every script (state files are version-sensitive).
 if [ -z "${TERRAFORM:-}" ]; then
-  if [ -x /snap/bin/terraform ]; then TERRAFORM=/snap/bin/terraform; else TERRAFORM="$(command -v terraform || true)"; fi
+  if [ -x /snap/bin/terraform ]; then TERRAFORM=/snap/bin/terraform                          # Linux
+  elif [ -x "$HOME/bin/terraform-1.16.4" ]; then TERRAFORM="$HOME/bin/terraform-1.16.4"     # macOS (brew's is older)
+  else TERRAFORM="$(command -v terraform || true)"; fi
 fi
 
 PREFIX="srm-iceberg"

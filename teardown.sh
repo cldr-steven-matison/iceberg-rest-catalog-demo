@@ -34,6 +34,22 @@ if [ "${TEARDOWN_UNATTENDED:-0}" != "1" ]; then
 fi
 T0=$(date +%s)
 step() { echo; echo "== [$(( ($(date +%s) - T0) / 60 ))m] $* =="; }
+# Wait until COUNT_CMD prints 0. A timed-out or failed call prints nothing: that is "no answer",
+# not "still there", so it retries. The wait ends early once list-clusters answers without the
+# cluster, and gives up after 15 min (the delete-cluster below then reports a refusal).
+cdw_wait() {
+  local cid=$1 what=$2 cmd=$3 n=0 c all
+  while :; do
+    c=$(eval "$cmd" 2>/dev/null)
+    [ "$c" = "0" ] && return 0
+    all=$(cdp dw list-clusters 2>/dev/null)
+    if [ -n "$all" ] && ! echo "$all" | jq -e --arg c "$cid" '.clusters[]?|select(.id==$c)' >/dev/null 2>&1; then
+      echo "    cluster $cid no longer listed"; return 0
+    fi
+    n=$((n+1)); [ $n -gt 45 ] && { echo "    !! $what still listed after 15 min (${c:-no answer})"; return 0; }
+    echo "    ...waiting $what (${c:-no answer})"; sleep 20
+  done
+}
 
 # --- 1. CDW + Data Hubs ------------------------------------------------------------------
 step "CDW clusters"
@@ -43,14 +59,14 @@ for CID in $(cdw_cluster_ids); do
   for VID in $(cdp dw list-vws --cluster-id "$CID" | jq -r '.vws[]?.id'); do
     echo "    delete-vw $VID"; cdp dw delete-vw --cluster-id "$CID" --vw-id "$VID" >/dev/null 2>&1 || true
   done
-  while [ "$(cdp dw list-vws --cluster-id "$CID" 2>/dev/null | jq '.vws|length')" != "0" ]; do echo "    ...waiting VWs"; sleep 20; done
+  cdw_wait "$CID" VWs "cdp dw list-vws --cluster-id $CID | jq '.vws|length'"
   for KID in $(cdp dw list-connectors --cluster-id "$CID" 2>/dev/null | jq -r '.connectors[]?.id'); do
     echo "    delete-connector $KID"; cdp dw delete-connector --cluster-id "$CID" --connector-id "$KID" >/dev/null 2>&1 || true
   done
   for DID in $(cdp dw list-dbcs --cluster-id "$CID" | jq -r '.dbcs[]? | select(.name|endswith("-default")|not) | .id'); do
     echo "    delete-dbc $DID"; cdp dw delete-dbc --cluster-id "$CID" --dbc-id "$DID" >/dev/null 2>&1 || true
   done
-  while [ "$(cdp dw list-dbcs --cluster-id "$CID" 2>/dev/null | jq '[.dbcs[]? | select(.name|endswith("-default")|not)] | length')" != "0" ]; do echo "    ...waiting DBCs"; sleep 20; done
+  cdw_wait "$CID" DBCs "cdp dw list-dbcs --cluster-id $CID | jq '[.dbcs[]? | select(.name|endswith(\"-default\")|not)] | length'"
   ACCEPTED=0
   for i in $(seq 1 10); do
     if cdp dw delete-cluster --cluster-id "$CID" >/dev/null 2>&1; then ACCEPTED=1; break; fi

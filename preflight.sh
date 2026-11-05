@@ -10,9 +10,9 @@ ok()   { echo "  ok   $*"; }
 fail() { echo "  FAIL $*"; echo; echo "PREFLIGHT FAILED"; exit 1; }
 
 echo "== preflight: tooling =="
-[ -n "$TERRAFORM" ] && [ -x "$TERRAFORM" ] || fail "terraform not found — install terraform >= 1.16 (snap install terraform) or set TERRAFORM=/path"
+[ -n "$TERRAFORM" ] && [ -x "$TERRAFORM" ] || fail "terraform not found — install terraform >= 1.16 and set TERRAFORM=/path"
 TFV=$("$TERRAFORM" version -json 2>/dev/null | jq -r '.terraform_version')
-[ "$(printf '%s\n1.16.0\n' "$TFV" | sort -V | head -1)" = "1.16.0" ] || fail "terraform $TFV at $TERRAFORM is older than 1.16 — use /snap/bin/terraform"
+[ "$(printf '%s\n1.16.0\n' "$TFV" | sort -V | head -1)" = "1.16.0" ] || fail "terraform $TFV at $TERRAFORM is older than 1.16 — set TERRAFORM=/path to a 1.16+ binary"
 ok "terraform $TFV ($TERRAFORM)"
 for t in cdp aws jq curl; do command -v "$t" >/dev/null || fail "$t not on PATH"; done
 ok "cdp $(cdp --version 2>&1 | head -1 | awk '{print $NF}') · aws $(aws --version 2>&1 | awk '{print $1}' | cut -d/ -f2) · jq"
@@ -21,7 +21,7 @@ ok "impyla in ~/.venvs/cdpcli"
 [ -x "$CC_VENV/bin/ansible-playbook" ] || fail "$CC_VENV missing — see trino-demo/README.md 'Environment setup'"
 "$CC_VENV/bin/python" -c "import cdpy" 2>/dev/null || fail "cdpy missing in $CC_VENV — $CC_VENV/bin/pip install git+https://github.com/cloudera-labs/cdpy.git"
 VWMOD="$CC_VENV/collections/ansible_collections/cloudera/cloud/plugins/modules/dw_virtual_warehouse.py"
-grep -q -i trino "$VWMOD" 2>/dev/null || fail "cloudera.cloud in $CC_VENV has no Trino support — ansible-galaxy collection install git+https://github.com/cloudera-labs/cloudera.cloud.git,5ad1809 --force -p $CC_VENV/collections"
+grep -q -i trino "$VWMOD" 2>/dev/null || fail "cloudera.cloud in $CC_VENV has no Trino support — ansible-galaxy collection install git+https://github.com/cloudera-labs/cloudera.cloud.git,e7f1cea --force -p $CC_VENV/collections"
 ok "ansible $("$CC_VENV/bin/ansible" --version 2>/dev/null | head -1 | grep -o '[0-9.]*' | head -1) + cloudera.cloud (Trino) + cdpy in $CC_VENV"
 for d in "$DEMO" "$TF" "$TRINO"; do [ -d "$d" ] || fail "missing clone $d"; done
 [ -f "$TRINO/provision-trino-vw.yml" ] || fail "missing $TRINO/provision-trino-vw.yml"

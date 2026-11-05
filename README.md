@@ -55,7 +55,7 @@ read datashare: they route through Impala, the authoritative HMS Iceberg writer
 | Path | What it is |
 | :-- | :-- |
 | `test-rest-catalog.sh` | **Start here.** Read-only validation: JWT exchange → list namespaces → list tables → load a table (shows vended-cred keys). Never modifies CDP. |
-| `monday-redeploy.sh` | **The weekly rebuild, one command.** Bumps `enddate`, runs `teardown.sh` → `preflight.sh` → `redeploy.sh` → the Trino VW playbook from [`trino-demo`](https://github.com/cldr-steven-matison/trino-demo), verifies both, logs to `monday-redeploy-<date>.log`. Linux deploy host. |
+| `monday-redeploy.sh` | **The weekly rebuild, one command.** Bumps `enddate`, runs `teardown.sh` → `preflight.sh` → `redeploy.sh` → the Trino VW playbook from [`trino-demo`](https://github.com/cldr-steven-matison/trino-demo), verifies both, logs to `monday-redeploy-<date>-<HHMM>.log`. Linux or macOS deploy host. |
 | `teardown.sh` | Full, idempotent wipe of everything named `srm-iceberg` — CDW, Data Hubs, the CDP env (cascading), the terraform-owned AWS shell, then an orphan sweep by name/tag. Exits 1 if anything remains. |
 | `preflight.sh` | Read-only gate before `terraform apply`: tooling, auth, tfvars, empty terraform state, and zero `srm-iceberg` leftovers in CDP or AWS. |
 | `redeploy.sh` | Rebuild on an empty account — env + DataLake + Impala Data Hub, seed tables, enable REST Catalog, create external users, share tables, validate (~1h40m). |
